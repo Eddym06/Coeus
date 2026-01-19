@@ -123,6 +123,47 @@ B. RESULTADO STRESS TEST (30,000 Tokens):
 C. CONCLUSIÓN FINAL V2:
    La arquitectura Coeus V2 ha demostrado ser capaz de manejar contextos masivos (30k+) usando menos de 1GB de VRAM en hardware de laptop, validando el diseño "Inferencia de Contexto Infinito" propuesto inicialmente.
 
+8. UPGRADE A COEUS V2.5: ROTARY EMBEDDINGS + GQA
+--------------------------------------------------------------------------------
+Para alinear el modelo con los estándares State-of-the-Art (SOTA) de 2025, se realizó una refactorización mayor del código (`coeus.py`).
+
+A. IMPLEMENTACIÓN TÉCNICA:
+   1. **Rotary Positional Embeddings (RoPE):** 
+      - Se eliminaron los embeddings posicionales absolutos (`wpe`).
+      - Se implementó rotación compleja en el espacio de atención (`apply_rotary_pos_emb`).
+      - Ventaja: Mejor generalización a longitudes de secuencia no vistas durante el entrenamiento y mayor precisión relativa.
+   
+   2. **Grouped Query Attention (GQA):**
+      - Configuración: 6 Cabezas de Query vs 2 Cabezas de Key/Value (Ratio 3:1).
+      - Mecanismo: Se implementó `repeat_kv` para proyectar las claves comprimidas al espacio de atención completo.
+      - Ventaja: Reducción del tamaño de la caché KV y aceleración de inferencia y reducción de VRAM en entrenamiento.
+
+B. ANÁLISIS DE PERFILADO (PROFILING):
+   Se ejecutó `profile_coeus.py` para medir el impacto de las nuevas operaciones en un paso de entrenamiento.
+
+   - **Tiempo Total (Step):** ~452 ms (CUDA Time).
+   - **Consumo de Memoria:** Eficiente (Memory Virtual liberada post-backward).
+   - **Operaciones Dominantes:** 
+     1. `aten::copy_` y `aten::to`: Transferencia de datos (overhead de Python/Windows).
+     2. `aten::linear`: Proyecciones (esperado).
+     3. `SwiGLU`: Costo computacional moderado por las compuertas extra.
+
+   El perfilado confirma que la implementación de GQA y RoPE no introduce cuellos de botella significativos, manteniendo el tiempo de iteración dentro de rangos operativos aceptables para hardware de consumo.
+
+9. CONCLUSIÓN FINAL DEL PROYECTO
+--------------------------------------------------------------------------------
+El proyecto Coeus ha logrado implementar exitosamente una arquitectura "Linear Attention Recurrent" funcional en PyTorch puro. Se ha demostrado que:
+1. Es posible entrenar modelos RNN modernos eficientemente usando Parallel Scan en GPUs de Laptop.
+2. La arquitectura desacopla el consumo de memoria de la longitud de secuencia durante la inferencia.
+3. El modelo aprende patrones lingüísticos complejos (Shakespeare) con ~11M de parámetros.
+4. Coeus V2.5 integra tecnologías de punta (RoPE, GQA, SwiGLU) en un paquete compacto ("Nano") capaz de correr contextos de 30k tokens en 8GB de VRAM.
+
+STATUS DEL PROYECTO: COMPLETADO / LISTO PARA DEPLOY
+================================================================================
+FIN DEL INFORME
+================================================================================
+
+
 
 7. CONCLUSIÓN FINAL DEL PROYECTO
 --------------------------------------------------------------------------------
