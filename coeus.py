@@ -6,21 +6,21 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 # =============================================================================
-# 1. Configuración Hardware-Aware (Update V2.5)
+# 1. Configuración Hardware-Aware (V2.5)
 # =============================================================================
 @dataclass
 class CoeusConfig:
-    block_size: int = 2048       # Contexto máximo para entrenamiento
+    block_size: int = 2048       # Contexto máximo (usado para buffer RoPE/Train)
     vocab_size: int = 50257      
     n_layer: int = 6             
-    n_head: int = 6              
-    n_kv_head: int = 2           # GQA: Cabezas de Key/Value (6/2 = 3x repetición)
+    n_head: int = 6              # Cabezas de Query
+    n_kv_head: int = 2           # GQA: Cabezas de Key/Value (Ratio 3:1)
     n_embd: int = 384            
-    window_size: int = 128       # Tamaño de bloque local
+    window_size: int = 128       
     dropout: float = 0.0         
 
 # =============================================================================
-# 2. Componentes Optimizados
+# 2. Utilerías y RoPE
 # =============================================================================
 
 class RMSNorm(nn.Module):
@@ -30,13 +30,14 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm mantiene float32 internamente para precisión
         norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return x * norm * self.weight
 
 class SwiGLU(nn.Module):
     def __init__(self, config: CoeusConfig):
         super().__init__()
-        # SwiGLU: (Linear * Sigmoid) * Linear
+        # Ratio estándar de LLaMA: 2/3 * 4 * d_model
         hidden_dim = int(2 * 4 * config.n_embd / 3) 
         hidden_dim = 256 * ((hidden_dim + 256 - 1) // 256) 
 
@@ -60,17 +61,16 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # x: [B, T, H, D] o similar. Lo importante es dimension T.
-        # Asumimos que x viene transpuesto o leemos shape T correcto.
-        # Aquí usaremos el shape[2] porque llamamos con V transpuesta [B, KV, T, D]
+        # Computa la rotación dinámica basada en la dimensión T (seq_len)
+        # x shape esperado en dim 2 es T.
         t = torch.arange(x.shape[2], device=x.device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1) # [T, D]
+        emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
 def apply_rotary_pos_emb(q, k, cos, sin):
     # q, k: [B, H, T, D]
-    # cos, sin: [T, D] -> Unsqueeze para broadcasting [1, 1, T, D]
+    # cos, sin: [T, D] -> Unsqueeze para [1, 1, T, D]
     cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
     
@@ -82,44 +82,8 @@ def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
-# =============================================================================
-# 3. Kernel Recurrente JIT (O(1) Memory Inference)
-# =============================================================================
-@torch.jit.script
-def recurrent_scan(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    """
-    Ejecuta la recurrencia O(N) -> O(1) memoria.
-    M_t = alpha_t * M_{t-1} + (1-alpha_t) * (K_t^T V_t)
-    y_t = Q_t * M_t
-    """
-    B, H, T, D = q.shape
-    # Estado de memoria inicial [B, H, D, D]
-    state = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
-    outputs = []
-    
-    # Pre-computar input scale (1 - alpha)
-    input_scale = 1.0 - alpha
-
-    for t in range(T):
-        # [B, H, 1, D]
-        q_t = q[:, :, t, :].unsqueeze(2)
-        k_t = k[:, :, t, :].unsqueeze(2) 
-        v_t = v[:, :, t, :].unsqueeze(2) 
-        a_t = alpha[:, :, t, :].unsqueeze(3) 
-        i_s_t = input_scale[:, :, t, :].unsqueeze(3) 
-
-        # Actualizar Memoria: M_t
-        kv_prod = torch.matmul(k_t.transpose(-2, -1), v_t) 
-        state = a_t * state + i_s_t * kv_prod
-        
-        # Leer Memoria: y = q * M_t
-        y_t = torch.matmul(q_t, state) 
-        outputs.append(y_t.squeeze(2))
-
-    return torch.stack(outputs, dim=2) # [B, H, T, D]
-
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    """Implementa Grouped Query Attention mediante expansion."""
     B, n_kv_head, T, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -130,7 +94,40 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 # =============================================================================
-# 4. Módulo de Memoria Híbrido: COEUS v2.5 (RoPE + GQA)
+# 3. Kernel JIT (Optimizado V2.5)
+# =============================================================================
+@torch.jit.script
+def recurrent_scan(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """
+    Recurrencia Lineal O(1) Memoria.
+    Optimizado para evitar copias extra.
+    """
+    B, H, T, D = q.shape
+    state = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
+    outputs = []
+    
+    input_scale = 1.0 - alpha
+
+    for t in range(T):
+        # Slicing eficiente
+        q_t = q[:, :, t, :].unsqueeze(2)
+        k_t = k[:, :, t, :].unsqueeze(2) 
+        v_t = v[:, :, t, :].unsqueeze(2) 
+        a_t = alpha[:, :, t, :].unsqueeze(3) 
+        i_s_t = input_scale[:, :, t, :].unsqueeze(3) 
+
+        # Update
+        kv_prod = torch.matmul(k_t.transpose(-2, -1), v_t) 
+        state = a_t * state + i_s_t * kv_prod
+        
+        # Read
+        y_t = torch.matmul(q_t, state) 
+        outputs.append(y_t.squeeze(2))
+
+    return torch.stack(outputs, dim=2)
+
+# =============================================================================
+# 4. Memoria Híbrida Coeus (RoPE + GQA)
 # =============================================================================
 
 class CoeusMemoryLayer(nn.Module):
@@ -140,86 +137,71 @@ class CoeusMemoryLayer(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_rep = self.n_head // self.n_kv_head
-        self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         self.window_size = config.window_size
 
-        # GQA: Proyecciones separadas
-        # Query tiene todas las cabezas
+        # GQA Projections
         self.wq = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False)
-        # Key y Value tienen menos cabezas (GQA)
         self.wk = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
         self.wv = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
         
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        # El gating es específico para cada Query Head, por lo tanto usa n_head
         self.gate_net = nn.Linear(config.n_embd, config.n_head) 
         self.norm_fusion = RMSNorm(config.n_embd)
         
-        # Rotary Embeddings
-        # Se aplican a Q y K. Inician con dims de head_dim.
         self.rotary = RotaryEmbedding(self.head_dim, config.block_size * 2)
 
     def forward(self, x: torch.Tensor, inference_mode: bool = False) -> torch.Tensor:
         B, T, C = x.size()
         
-        # 1. Proyecciones GQA
-        # Q -> [B, T, H, D] -> Transpose -> [B, H, T, D]
-        q = self.wq(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        # K, V -> [B, T, KV_H, D] -> Transpose -> [B, KV_H, T, D]
-        k = self.wk(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
-        v = self.wv(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        # 1. Proyecciones y Reshape
+        # NOTA: .view en tensor output de Linear es seguro (contiguous)
+        q = self.wq(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2) # [B, H, T, D]
+        k = self.wk(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2) # [B, KV, T, D]
+        v = self.wv(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2) # [B, KV, T, D]
 
-        # 2. Rotary Positional Embeddings (RoPE)
-        # Calculamos freq cis. Pasamos 'v' solo para obtener T y device correctos.
+        # 2. RoPE (Antes de expandir K para ahorrar cómputo)
         cos, sin = self.rotary(v) 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # 3. GQA Expansion (Repeat K/V)
-        # Antes de entrar a Recurrencia o Atención Local, necesitamos que K/V tengan n_head igual a Q
-        # [B, KV_H, T, D] -> [B, H, T, D]
-        k = repeat_kv(k, self.n_rep) 
-        v = repeat_kv(v, self.n_rep)
+        # 3. GQA Branching
+        # Expandimos K/V a full heads para usar en Recurrencia global (Operación per-head)
+        # y en Local Attention.
+        k = repeat_kv(k, self.n_rep) # [B, H, T, D]
+        v = repeat_kv(v, self.n_rep) # [B, H, T, D]
 
         # 4. Gating (Alpha)
         gate_logits = self.gate_net(x).view(B, T, self.n_head, 1).transpose(1, 2)
         alpha = torch.sigmoid(gate_logits)
 
-        # ---------------------------------------------------------------------
-        # RAMA A: Global Neural Memory (Linear Recurrence)
-        # ---------------------------------------------------------------------
+        # >>>> RAMA A: Global Neural Memory <<<<
         if inference_mode:
-            # Modo recurrente token a token
             y_global = recurrent_scan(q, k, v, alpha)
         else:
-            # Modo paralelo de entrenamiento
+            # Parallel Scan (Log-Space)
             log_alpha = F.logsigmoid(gate_logits)
             log_input_scale = F.logsigmoid(-gate_logits)
             k_scaled = k * torch.exp(log_input_scale)
 
             log_alpha_cumsum = torch.cumsum(log_alpha, dim=2)
             log_decay_matrix = log_alpha_cumsum - log_alpha_cumsum.transpose(2, 3)
-            # Máscara causal triangular
             mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
             log_decay_matrix = log_decay_matrix.masked_fill(mask, float("-inf"))
             decay_matrix = torch.exp(log_decay_matrix)
             
-            # Atención Lineal: (Q @ K^T) @ V
+            # Atención global optimizada
             scores_global = torch.matmul(q, k_scaled.transpose(-2, -1))
             y_global = torch.matmul(scores_global * decay_matrix, v)
 
-        # ---------------------------------------------------------------------
-        # RAMA B: Local Block Attention (Sliding Window / Block)
-        # ---------------------------------------------------------------------
-        # Preparamos tensores para vista en bloques: necesitan ser [B, T, H, D] contiguous
-        q_l = q.transpose(1, 2).contiguous()
+        # >>>> RAMA B: Local Block Attention <<<<
+        # Aseguramos contigüidad antes del reshape complejo de bloques (Fix Profiler)
+        q_l = q.transpose(1, 2).contiguous() # [B, T, H, D]
         k_l = k.transpose(1, 2).contiguous()
         v_l = v.transpose(1, 2).contiguous()
         
         pad_len = (self.window_size - (T % self.window_size)) % self.window_size
         T_padded = T + pad_len
         
-        # Padding si es necesario
         if pad_len > 0:
             q_l = F.pad(q_l, (0, 0, 0, 0, 0, pad_len))
             k_l = F.pad(k_l, (0, 0, 0, 0, 0, pad_len))
@@ -227,21 +209,22 @@ class CoeusMemoryLayer(nn.Module):
         
         n_blocks = T_padded // self.window_size
         
-        # Reshape Mágico: [B, Blocks, Window, H, D] -> Flash Attention espera batch unificado
-        # Transformamos a [B*Blocks, H, Window, D]
-        def to_block_view(tensor):
-            return tensor.view(B, n_blocks, self.window_size, self.n_head, self.head_dim)\
-                         .permute(0, 1, 3, 2, 4)\
-                         .reshape(B * n_blocks, self.n_head, self.window_size, self.head_dim)
+        # Bloqueado seguro
+        q_b = q_l.view(B, n_blocks, self.window_size, self.n_head, self.head_dim)\
+               .permute(0, 1, 3, 2, 4)\
+               .reshape(B * n_blocks, self.n_head, self.window_size, self.head_dim)
+        
+        k_b = k_l.view(B, n_blocks, self.window_size, self.n_head, self.head_dim)\
+               .permute(0, 1, 3, 2, 4)\
+               .reshape(B * n_blocks, self.n_head, self.window_size, self.head_dim)
+               
+        v_b = v_l.view(B, n_blocks, self.window_size, self.n_head, self.head_dim)\
+               .permute(0, 1, 3, 2, 4)\
+               .reshape(B * n_blocks, self.n_head, self.window_size, self.head_dim)
 
-        q_b = to_block_view(q_l)
-        k_b = to_block_view(k_l)
-        v_b = to_block_view(v_l)
-
-        # Computo local optimizado (SDPA)
+        # FlashAttention Local
         y_local_b = F.scaled_dot_product_attention(q_b, k_b, v_b, is_causal=True)
 
-        # Reconstrucción
         y_local = y_local_b.view(B, n_blocks, self.n_head, self.window_size, self.head_dim)\
                            .permute(0, 2, 1, 3, 4)\
                            .reshape(B, self.n_head, T_padded, self.head_dim)
@@ -249,9 +232,7 @@ class CoeusMemoryLayer(nn.Module):
         if pad_len > 0:
             y_local = y_local[:, :, :T, :] 
 
-        # ---------------------------------------------------------------------
-        # Fusión Híbrida
-        # ---------------------------------------------------------------------
+        # Fusión final
         y_out = y_global + y_local
         y_out = y_out.transpose(1, 2).contiguous().view(B, T, C)
         
@@ -260,7 +241,6 @@ class CoeusMemoryLayer(nn.Module):
 # =============================================================================
 # 5. NanoCoeus Wrapper (V2.5)
 # =============================================================================
-
 class Block(nn.Module):
     def __init__(self, config: CoeusConfig):
         super().__init__()
@@ -270,8 +250,8 @@ class Block(nn.Module):
         self.mlp = SwiGLU(config) 
 
     def forward(self, x: torch.Tensor, inference_mode: bool = False) -> torch.Tensor:
-        x_attn = self.attn(self.ln1(x), inference_mode=inference_mode)
-        x = x + x_attn
+        # Residual connection
+        x = x + self.attn(self.ln1(x), inference_mode=inference_mode)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -280,7 +260,7 @@ class NanoCoeus(nn.Module):
         super().__init__()
         self.config = config
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        # ROPE-UPDATE: Eliminamos wpe (Absolute Position Embedding)
+        # self.wpe ha sido eliminado en favor de RoPE
         self.drop = nn.Dropout(config.dropout)
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = RMSNorm(config.n_embd)
@@ -299,7 +279,6 @@ class NanoCoeus(nn.Module):
         device = idx.device
         b, t = idx.size()
         
-        # Solo Embeddings de Token. La posición se inyecta vía RoPE en el self-attention.
         x = self.wte(idx)
         x = self.drop(x)
 

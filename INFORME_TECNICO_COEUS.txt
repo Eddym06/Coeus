@@ -163,7 +163,7 @@ STATUS DEL PROYECTO: COMPLETADO / LISTO PARA DEPLOY
 FIN DEL INFORME
 ================================================================================
 
-
+Avanzando vamos. 
 
 7. CONCLUSIÓN FINAL DEL PROYECTO
 --------------------------------------------------------------------------------

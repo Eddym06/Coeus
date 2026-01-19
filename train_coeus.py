@@ -18,11 +18,14 @@ torch.backends.cudnn.allow_tf32 = True
 # =============================================================================
 # Estrategia: "VRAM-First". Evitamos desbordar a RAM del sistema (Shared Memory)
 # Batch size pequeño compensado con Gradient Accumulation implícito (si quisiéramos)
-BATCH_SIZE = 2       # VRAM-Safe Mode: Bajamos a 2 para asegurar estabilidad con contexto 2048.
-BLOCK_SIZE = 2048    # Contexto 
-MAX_ITERS = 5000
-EVAL_INTERVAL = 250  # Evaluar más frecuente al principio
-LEARNING_RATE = 6e-4
+# =============================================================================
+# CONFIGURACIÓN TURBO (RTX 4050 6GB - GQA Enabled)
+# =============================================================================
+BATCH_SIZE = 4       # Reducido de 16 a 4 por OOM en matrices NxN.
+BLOCK_SIZE = 2048    # Contexto de entrenamiento sólido.
+MAX_ITERS = 10000    # Vamos a darle más tiempo (antes 5000).
+EVAL_INTERVAL = 500 
+LEARNING_RATE = 5e-4 # Un poco más conservador para estabilidad
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Preferimos bfloat16 (Ampere+) si está disponible, es más estable numéricamente que float16
 DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -34,14 +37,17 @@ print(f"Target Memory: Strict VRAM (Avoid Shared RAM)")
 print("-" * 40)
 
 # =============================================================================
-# 2. DATASET: TINY SHAKESPEARE
+# 2. DATASET: LITERARY MIX (Alice, Frankenstein, Holmes)
 # =============================================================================
 file_path = 'input.txt'
+# El archivo input.txt ya fuedescargado por prepare_data.py
 if not os.path.exists(file_path):
-    print(">> Downloading TinyShakespeare dataset...")
-    data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    with open(file_path, 'w') as f:
-        f.write(requests.get(data_url).text)
+     print("Error: input.txt not found. Run prepare_data.py first.")
+     exit()
+
+# Si quieres volver a descargar el original de shakespeare (NO LO HACEMOS, USAMOS EL NUEVO)
+# if not os.path.exists(file_path):
+#    ...
 
 with open(file_path, 'r', encoding='utf-8') as f:
     text = f.read()
