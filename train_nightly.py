@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import tiktoken
 
-# Importar el nuevo modelo refinado
-from coeus_v2_5_logic import Coeus, CoeusConfig
+# Importar el nuevo modelo refinado V3
+from coeus_v3_reasoning import Coeus, CoeusConfig
 
 # =============================================================================
 # CONFIGURACIÓN "SMART TRAIN NIGHTLY" (6 HOURS ROBUST)
@@ -20,7 +20,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 torch.set_float32_matmul_precision('high') 
 
-# Hyperparameters REFINED for Long Run
+# Hyperparameters REFINED for Long Run VI (Reasoning Edition)
 BATCH_SIZE = 4        
 GRAD_ACCUM_STEPS = 16 # Effective Batch 64
 BLOCK_SIZE = 1024     
@@ -28,12 +28,12 @@ MAX_ITERS = 5000
 LEARNING_RATE = 1.6e-4  # Lowered slightly for stability over long run
 MIN_LR = 1.6e-5
 WARMUP_ITERS = 500
-PATIENCE = 15         # Tolerancia mucho mayor para permitir fluctuaciones de aprendizaje
+PATIENCE = 20         # Aumentado para V3 (Deep Reasoning necesita mas tiempo de settling)
 MIN_ITERS_BEFORE_STOP = 2000 # Obligar a entrenar al menos 2000 pasos (aprox 2.5h)
 
-DATA_FILE = 'logic_mix_large.txt' # Dataset grande
-CKPT_BEST = 'coeus_logic_best.pt'
-CKPT_LAST = 'coeus_logic_last.pt'
+DATA_FILE = 'dataset_grok_combined.txt' # Dataset grande
+CKPT_BEST = 'coeus_reasoning_best.pt'
+CKPT_LAST = 'coeus_reasoning_last.pt'
 
 # =============================================================================
 # UTILS
@@ -92,7 +92,7 @@ def main():
     # 2. Init Model
     config = CoeusConfig()
     config.max_seq_len = BLOCK_SIZE
-    print(f"Initializing COEUS V2.5 LOGIC (RoPE+RNN+Gated)...")
+    print(f"Initializing COEUS V3.0 REASONING (LogicGate + DeepRecursive)...")
     model = Coeus(config).to(DEVICE)
     
     # EAGER MODE ONLY (Stability)

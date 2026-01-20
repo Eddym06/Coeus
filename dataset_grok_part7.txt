@@ -1,0 +1,838 @@
+
+
+# CAPITULO 7: Depuración Ofensiva y Hacking Ético
+
+# Capítulo 7: Depuración Ofensiva y Hacking Ético
+
+## Introducción a la Depuración Ofensiva en Python
+
+En el ámbito del hacking ético y la depuración ofensiva, Python emerge como un lenguaje pivotal debido a su introspección dinámica, su manejo flexible de la ejecución en tiempo de ejecución (runtime) y su capacidad para manipular el estado interno del intérprete. La depuración ofensiva no se limita a identificar bugs en tu propio código; implica técnicas agresivas para inspeccionar, alterar y subvertir el comportamiento de aplicaciones ajenas o propias en entornos controlados, siempre dentro de marcos éticos y legales como pruebas de penetración autorizadas. En este capítulo, nos sumergiremos en técnicas avanzadas de debugging que van más allá de las herramientas integradas básicas, explorando el módulo `pdb` en profundidad, el uso de `sys.settrace` para trazado personalizado, la introspección de stack frames mediante el módulo `inspect`, y culminaremos con la implementación de un debugger simple que permite ejecución paso a paso. Finalmente, analizaremos la inyección de código en runtime vía monkey-patching, enfatizando prácticas seguras para evitar corrupciones impredecibles en el estado del programa.
+
+Desde una perspectiva de bajo nivel, recordemos que Python se ejecuta sobre una máquina virtual (PVM, Python Virtual Machine) que interpreta bytecode generado por el compilador de Python. Cada instrucción de bytecode opera sobre objetos PyObject en la pila de ejecución, gestionados por el recolector de basura (Garbage Collector) y referencias contadas (reference counting). Cuando hablamos de debugging, estamos interfiriendo con esta pila, los frames de ejecución (PyFrameObject en CPython) y el flujo de control. Por ejemplo, un puntero en C equivalente a un frame de Python apunta a una estructura que contiene locals, globals, código bytecode y un contador de programa (pc). Manipular estos elementos en Python puro requiere abstracciones de alto nivel, pero para entender la depuración ofensiva, descendamos al nivel de bits: un frame se representa internamente como un bloque de memoria con offsets fijos (e.g., f_localsplus es un array de PyObject* que almacena variables locales, con cada PyObject consumiendo al menos 24 bytes en 64-bit systems, incluyendo refcount y type pointer).
+
+Esta introducción sienta las bases para técnicas que un hacker ético usaría para auditar código propietario sin acceso al fuente, inyectando breakpoints dinámicos o alterando flujos condicionales en runtime. Procedamos con exhaustividad.
+
+## Técnicas Avanzadas con el Módulo `pdb`
+
+El módulo `pdb` (Python Debugger) es la herramienta de debugging integrada en la biblioteca estándar de Python, basada en el debugger de BDB (bdb module). `pdb` proporciona un interfaz de comandos interactivo similar a gdb, permitiendo breakpoints, stepping, inspección de variables y más. En contextos ofensivos, `pdb` se usa para pausar ejecuciones en puntos críticos, como funciones de autenticación, para inspeccionar flujos de datos sensibles.
+
+### Fundamentos Internos de `pdb`
+
+Internamente, `pdb` hereda de `bdb.Bdb`, que a su vez usa `sys.settrace` para hookear el trazador del intérprete. Cada vez que Python ejecuta una línea (o instrucción), el trazador se invoca con un frame, un evento (e.g., 'line', 'call', 'return') y un argumento. `pdb` intercepta estos eventos para pausar en breakpoints. Desde bajo nivel, un breakpoint en `pdb` se implementa insertando un opcode OP_BREAKPOINT en el bytecode (en CPython 3.11+), que genera un SystemError si no está en modo debug, pero `pdb` lo maneja modificando el código en memoria.
+
+Para usar `pdb` de forma avanzada, considera post-mortem debugging: tras una excepción, `pdb.pm()` revive el stack trace. En hacking ético, esto es útil para analizar crashes en aplicaciones web (e.g., Flask) sin reiniciar el servidor.
+
+### Ejemplo Extenso: Debugging Interactivo con `pdb`
+
+Imaginemos un script vulnerable a inyección SQL simulada (ético: solo para demo). Escribamos un módulo completo que integra `pdb` para depurarlo.
+
+```python
+# modulo_debug_vulnerable.py
+import pdb
+import sqlite3
+from typing import Optional
+
+class VulnerableDB:
+    def __init__(self, db_path: str = ":memory:"):
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self._setup_schema()
+    
+    def _setup_schema(self):
+        self.cursor.execute("""
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                username TEXT UNIQUE,
+                password TEXT,
+                email TEXT
+            )
+        """)
+        # Datos de prueba
+        self.cursor.executemany(
+            "INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
+            [
+                ("admin", "secret123", "admin@example.com"),
+                ("user1", "pass456", "user1@example.com")
+            ]
+        )
+        self.conn.commit()
+    
+    def authenticate(self, username: str, password: str) -> Optional[dict]:
+        # Punto vulnerable: sin sanitización
+        query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
+        pdb.set_trace()  # Breakpoint aquí para inspeccionar inyección
+        try:
+            self.cursor.execute(query)
+            result = self.cursor.fetchone()
+            if result:
+                return {
+                    "id": result[0],
+                    "username": result[1],
+                    "email": result[3]
+                }
+            return None
+        except sqlite3.Error as e:
+            print(f"DB Error: {e}")
+            pdb.post_mortem()  # Post-mortem en errores
+            return None
+    
+    def close(self):
+        self.conn.close()
+
+# Función de prueba para demo
+def test_vulnerable_auth(db: VulnerableDB):
+    # Intento normal
+    print("Autenticación normal:")
+    user = db.authenticate("admin", "secret123")
+    if user:
+        print(f"Éxito: {user['username']}")
+    
+    # Intento de inyección (ético: simulación)
+    print("\nIntento de inyección:")
+    injected_user = db.authenticate("admin' --", "anything")
+    if injected_user:
+        print(f"Inyección exitosa: {injected_user}")
+
+if __name__ == "__main__":
+    db = VulnerableDB()
+    test_vulnerable_auth(db)
+    db.close()
+```
+
+Ejecuta este módulo con `python -m pdb modulo_debug_vulnerable.py`. En el prompt `(Pdb)`, comandos como `n` (next), `s` (step), `c` (continue), `p variable` (print) permiten navegar. En el breakpoint de `authenticate`, inspecciona `query` para ver la inyección SQL: `'admin' --` comenta el resto, bypassando la contraseña. Para depuración ofensiva, usa `pdb` en scripts remotos vía `import pdb; pdb.set_trace()` inyectado dinámicamente (veremos más adelante).
+
+Avanzando, `pdb` soporta breakpoints condicionales: `break function.py:42 if condition`. Internamente, esto evalúa la condición en cada hit, usando el frame local para acceso a variables. Repitiendo para matices: en multihilo, `pdb` solo pausa el thread actual, pero puedes extenderlo con `threading` hooks. Para bajo nivel, nota que `pdb` interactúa con la GIL (Global Interpreter Lock), pausando solo un thread a la vez, lo que en apps concurrentes requiere cuidado para evitar deadlocks.
+
+Extensión: integra `pdb` con logging para traces persistentes.
+
+```python
+# extension_pdb_logging.py
+import pdb
+import logging
+from bdb import BdbQuit
+
+class LoggingPdb(pdb.Pdb):
+    def __init__(self, *args, log_file="debug.log", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logger = logging.getLogger("pdb_trace")
+        handler = logging.FileHandler(log_file)
+        formatter = logging.Formatter('%(asctime)s - %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        self.logger.setLevel(logging.DEBUG)
+    
+    def user_line(self, frame):
+        # Log antes de pausar
+        code = frame.f_code
+        lineno = frame.f_lineno
+        self.logger.debug(f"Line {lineno} in {code.co_filename}: {code.co_name}")
+        super().user_line(frame)
+    
+    def do_continue(self, arg):
+        self.logger.debug("Continuing execution")
+        return super().do_continue(arg)
+
+# Uso
+if __name__ == "__main__":
+    pdb = LoggingPdb()
+    pdb.set_trace()  # Entra en modo debug con logging
+    # Aquí va tu código a debuggear
+    for i in range(5):
+        print(i)
+        if i == 2:
+            raise ValueError("Test error")
+```
+
+Este subclassing extiende `pdb` para logging, útil en audits éticos donde necesitas evidencia no interactiva. En términos de memoria, cada frame en el log referencia strings inmutables (co_filename es un PyUnicodeObject), consumiendo heap space; monitorea con `sys.getsizeof()` para leaks.
+
+## Uso Avanzado de `sys.settrace` para Trazado Personalizado
+
+`sys.settrace(trace_func)` es el corazón de la depuración dinámica en Python. Asigna una función de callback que se invoca en eventos clave: 'call' (entrada a función), 'line' (nueva línea), 'return' (salida), 'exception' (excepción), y 'opcode' (por instrucción bytecode, si habilitado). Esta es la base para debuggers personalizados en hacking ético, permitiendo inyección de lógica sin modificar el código fuente.
+
+### Mecánica Interna de `sys.settrace`
+
+Desde CPython, `settrace` modifica el thread state (PyThreadState) para apuntar a tu trace function. Cada evento pasa un frame (PyFrameObject*), event string, y arg (e.g., exception tuple). El frame contiene punteros a co_code (bytecode bytes, un array de uint8_t), co_consts (tupla de constantes), y f_stacktop (puntero a la pila de valores). En bajo nivel, al invocar el trace, Python empuja argumentos a la pila virtual, y si trace retorna None, continúa; si retorna una función, la usa para el próximo evento.
+
+En depuración ofensiva, `sys.settrace` permite monitorear llamadas a APIs sensibles (e.g., os.system) o alterar returns para bypass security checks.
+
+### Implementación de un Tracer Básico
+
+Escribamos un módulo completo para un tracer que loguea llamadas y detecta patrones sospechosos, como accesos a archivos sensibles.
+
+```python
+# modulo_sys_settrace.py
+import sys
+import dis
+from typing import Optional, Callable
+from functools import wraps
+
+class SuspiciousTracer:
+    def __init__(self, suspicious_patterns: list[str] = None):
+        self.suspicious_patterns = suspicious_patterns or [
+            "os.system", "subprocess.call", "open(/etc/passwd)", "eval("
+        ]
+        self.trace_log = []
+        self.event_count = 0
+    
+    def trace_func(self, frame: 'frame', event: str, arg: Optional[object]) -> Optional[Callable]:
+        self.event_count += 1
+        code = frame.f_code
+        filename = code.co_filename
+        funcname = code.co_name
+        lineno = frame.f_lineno
+        
+        # Log evento
+        log_entry = {
+            'event': event,
+            'filename': filename,
+            'funcname': funcname,
+            'lineno': lineno,
+            'locals': dict(frame.f_locals),
+            'globals': {k: '<complex>' if callable(v) else str(v)[:50] for k, v in frame.f_globals.items()}
+        }
+        self.trace_log.append(log_entry)
+        
+        # Detección ofensiva: chequea patrones en locals o código
+        if event == 'line':
+            source_line = self._get_source_line(filename, lineno)
+            for pattern in self.suspicious_patterns:
+                if pattern in source_line or any(pattern in str(val) for val in frame.f_locals.values()):
+                    print(f"SOSPECHOSO en {filename}:{lineno}: {source_line}")
+                    print(f"Locals: {frame.f_locals}")
+                    # Opcional: pausar o alterar
+                    import pdb; pdb.set_trace()
+        
+        # Para 'return', inspecciona el valor retornado
+        if event == 'return':
+            log_entry['return_value'] = arg
+            if isinstance(arg, str) and 'password' in funcname.lower():
+                print(f"Potencial leak: {funcname} retorna '{arg[:10]}...'")
+        
+        # Retorna self.trace_func para continuar tracing
+        return self.trace_func
+    
+    def _get_source_line(self, filename: str, lineno: int) -> str:
+        try:
+            with open(filename, 'r') as f:
+                lines = f.readlines()
+                return lines[lineno - 1].strip() if lineno - 1 < len(lines) else "<unknown>"
+        except FileNotFoundError:
+            # Para código dinámico, usa dis
+            import inspect
+            if inspect.getsourcefile(sys._getframe()) == filename:
+                return f"<dynamic code at line {lineno}>"
+            return "<no source>"
+    
+    def start_tracing(self):
+        sys.settrace(self.trace_func)
+        print("Tracing iniciado. Eventos monitoreados.")
+    
+    def stop_tracing(self):
+        sys.settrace(None)
+        print(f"Tracing detenido. {self.event_count} eventos procesados.")
+        return self.trace_log
+    
+    def analyze_log(self):
+        for entry in self.trace_log:
+            if entry['event'] == 'call':
+                print(f"Llamada a {entry['funcname']} en {entry['filename']}:{entry['lineno']}")
+
+# Decorator para tracing selectivo
+def trace_decorator(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        tracer = SuspiciousTracer()
+        tracer.start_tracing()
+        try:
+            result = func(*args, **kwargs)
+        finally:
+            log = tracer.stop_tracing()
+            tracer.analyze_log()
+        return result
+    return wrapper
+
+# Ejemplo de uso: función "sospechosa"
+@trace_decorator
+def suspicious_function(user_input: str):
+    import os
+    # Simula inyección
+    cmd = f"ls {user_input}"  # Vulnerable a command injection
+    if '..' in user_input:
+        print("Patrón sospechoso detectado internamente")
+    result = os.popen(cmd).read()
+    return result
+
+# Script principal
+if __name__ == "__main__":
+    print("Ejecutando función sospechosa...")
+    try:
+        output = suspicious_function("../etc")
+        print(f"Output: {output}")
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    # Tracing global
+    global_tracer = SuspiciousTracer(suspicious_patterns=["popen", "../"])
+    global_tracer.start_tracing()
+    suspicious_function("safe_input")
+    logs = global_tracer.stop_tracing()
+    print(f"Logs finales: {len(logs)} entradas")
+```
+
+Este tracer detecta patrones como command injection. En ejecución, `sys.settrace` se activa, logueando cada evento. Bajo nivel: cada llamada a trace_func empuja frames a la pila C, y si excede recursión (default 1000), causa RecursionError. En hacking ético, úsalo para hookear módulos como `requests` y capturar payloads HTTP.
+
+Repitiendo con matices: para tracing por opcode (fino-grained), usa `sys.settrace` con event 'opcode' (requiere Python 3.7+), donde arg es el opcode int (e.g., LOAD_GLOBAL=116). Esto permite debugging a nivel de VM, similar a desensamblar con `dis.dis`.
+
+```python
+# extension_opcode_trace.py
+import sys
+import dis
+
+def opcode_trace(frame, event, arg):
+    if event == 'opcode':
+        code_obj = frame.f_code
+        pc = frame.f_lasti  # Program counter
+        try:
+            opcode = code_obj.co_code[pc]
+            opname = dis.opname[opcode]
+            print(f"Opcode {opname} (#{opcode}) at PC {pc} in {code_obj.co_name}")
+        except IndexError:
+            pass
+    return opcode_trace
+
+sys.settrace(opcode_trace)
+# Tu código aquí
+def test_func(x):
+    y = x + 1  # Desensamblará a LOAD_FAST, LOAD_CONST(1), BINARY_ADD, STORE_FAST
+    return y
+
+test_func(5)
+sys.settrace(None)
+```
+
+Aquí, ves opcodes como BINARY_ADD manipulando PyLongObjects en la pila (internamente, long digits en base 2^30 para bigints).
+
+## Introspección de Stack Frames con el Módulo `inspect`
+
+El módulo `inspect` proporciona funciones para examinar objetos vivos, stack frames y código fuente, esencial para debuggers dinámicos. En hacking ético, `inspect` permite extraer variables de frames ajenos, inyectar hooks o reconstruir call stacks sin traces.
+
+### Detalles Internos de Stack Frames
+
+Un stack frame en Python es un PyFrameObject con campos como f_back (frame anterior), f_code (PyCodeObject*), f_locals (dict de locals), f_globals (dict), f_builtins (builtins dict). `inspect.currentframe()` retorna el frame actual vía PyEval_GetFrame(). Bajo nivel, locals se almacenan en f_localsplus (array de PyObject*, size co_nlocals + co_stacksize), con fast locals en los primeros slots para optimización (evitando dict lookups).
+
+Funciones clave: `inspect.stack()` retorna lista de (frame, filename, lineno, funcname, code_context, index). `inspect.getargvalues(frame)` extrae args y locals.
+
+### Módulo Completo para Introspección Avanzada
+
+```python
+# modulo_inspect_stack.py
+import inspect
+import sys
+import traceback
+from typing import List, Dict, Any, Tuple
+from collections import defaultdict
+
+class StackIntrospector:
+    def __init__(self):
+        self.frames_cache = {}
+    
+    def get_current_stack(self) -> List[Dict[str, Any]]:
+        """Retorna stack completo con detalles introspectivos."""
+        stack = inspect.stack()
+        detailed_stack = []
+        for frame_info in stack:
+            frame, filename, lineno, funcname, context, index = frame_info
+            details = {
+                'filename': filename,
+                'lineno': lineno,
+                'funcname': funcname,
+                'code_context': context,
+                'index': index,
+                'args': self._extract_args(frame),
+                'locals': dict(frame.f_locals),
+                'globals_keys': list(frame.f_globals.keys()),
+                'builtins_keys': list(frame.f_builtins.keys()),
+                'source_line': self._get_source_line(filename, lineno)
+            }
+            # Introspección profunda: chequea closures y cells
+            if frame.f_code.co_flags & inspect.CO_NESTED:
+                details['closure'] = [cell.cell_contents for cell in frame.f_code.co_cellvars]
+            detailed_stack.append(details)
+            # Cache para análisis posterior
+            self.frames_cache[funcname] = details
+        return detailed_stack
+    
+    def _extract_args(self, frame) -> Dict[str, Any]:
+        """Extrae argumentos usando getargvalues."""
+        try:
+            args, varargs, varkw, locals = inspect.getargvalues(frame)
+            return {
+                'args': {arg: locals[arg] for arg in args},
+                'varargs': locals.get(varargs, None),
+                'varkw': locals.get(varkw, None)
+            }
+        except ValueError:
+            return {'error': 'Frame no callable'}
+    
+    def _get_source_line(self, filename: str, lineno: int) -> str:
+        try:
+            with open(filename, 'r') as f:
+                lines = f.readlines()
+                return lines[lineno - 1].strip() if lineno - 1 < len(lines) else "<EOF>"
+        except:
+            return "<no source available>"
+    
+    def analyze_security_context(self, stack: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        """Análisis ofensivo: detecta contextos sensibles."""
+        findings = defaultdict(list)
+        for i, frame in enumerate(stack):
+            locals = frame['locals']
+            # Chequea por datos sensibles
+            for key, val in locals.items():
+                if any(sens in key.lower() for sens in ['pass', 'secret', 'token', 'key']):
+                    findings['sensitive_vars'].append(f"Frame {i} ({frame['funcname']}): {key} = {str(val)[:20]}")
+                if isinstance(val, str) and len(val) > 100 and 'SELECT' in val.upper():
+                    findings['potential_sql'].append(f"Frame {i}: SQL-like string in {key}")
+            # Chequea stack para privilege escalation
+            if 'os' in frame['globals_keys'] or 'subprocess' in frame['globals_keys']:
+                findings['os_access'].append(f"Frame {i}: OS modules imported in {frame['funcname']}")
+        return dict(findings)
+    
+    def reconstruct_call_graph(self) -> Dict[str, List[str]]:
+        """Reconstruye grafo de llamadas desde stack."""
+        stack = self.get_current_stack()
+        graph = defaultdict(list)
+        for i in range(1, len(stack)):
+            caller = stack[i]['funcname']
+            callee = stack[i-1]['funcname']
+            graph[caller].append(callee)
+        return dict(graph)
+    
+    def inject_inspection(self, target_func):
+        """Decorator para inyectar introspección en funciones."""
+        @wraps(target_func)
+        def wrapper(*args, **kwargs):
+            print("Inyectando introspección...")
+            stack = self.get_current_stack()
+            print(f"Stack depth: {len(stack)}")
+            sec_findings = self.analyze_security_context(stack)
+            if sec_findings:
+                print("Hallazgos de seguridad:")
+                for cat, items in sec_findings.items():
+                    print(f"{cat}: {items}")
+            result = target_func(*args, **kwargs)
+            return result
+        return wrapper
+
+# Función de ejemplo con datos sensibles
+def sensitive_handler(user_data: str):
+    password = "supersecret123"  # Simula storage
+    query = f"UPDATE users SET pass='{password}' WHERE data='{user_data}'"
+    print(f"Ejecutando: {query}")
+    return {"status": "updated", "query": query}
+
+# Uso
+if __name__ == "__main__":
+    introspector = StackIntrospector()
+    
+    # Introspección manual
+    print("=== Stack Introspección Manual ===")
+    try:
+        sensitive_handler("malicious_input'")
+    except:
+        # Captura stack en excepción
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        stack = introspector.get_current_stack()
+        print(f"Stack durante excepción: {len(stack)} frames")
+        findings = introspector.analyze_security_context(stack)
+        print(findings)
+    
+    # Decorator inyección
+    traced_handler = introspector.inject_inspection(sensitive_handler)
+    traced_handler("safe_data")
+    
+    # Grafo de llamadas
+    print("\n=== Grafo de Llamadas ===")
+    graph = introspector.reconstruct_call_graph()
+    for caller, callees in graph.items():
+        print(f"{caller} -> {callees}")
+    
+    # Análisis profundo: examina un frame específico
+    frame = inspect.currentframe().f_back
+    print(f"\nArgs en frame back: {introspector._extract_args(frame)}")
+```
+
+Este módulo usa `inspect` para diseccionar stacks, detectando leaks. En ofensivo, inyéctalo en procesos running vía `sys.settrace` + `inspect`. Repitiendo: `inspect.getclosurevars(frame)` revela variables de closure, útiles para auditing lambdas en configs.
+
+## Implementación de un Debugger Simple para Ejecución Step-by-Step
+
+Construyamos un debugger simple inspirado en `pdb`, usando `sys.settrace` e `inspect`. Permitirá stepping (s), next (n), continue (c), print (p), y breakpoints. Este es un debugger from-scratch para entender internals.
+
+### Diseño del Debugger
+
+El debugger usará un loop de comandos, hookeando trace para pausar en líneas. Internamente, mantendrá un dict de breakpoints (filename:lineno -> True). Para stepping, trackea frames y eventos 'line'.
+
+```python
+# simple_debugger.py - Módulo Completo del Debugger Simple
+import sys
+import cmd
+import inspect
+import bdb
+import dis
+from typing import Optional, Callable, Dict, Set
+from code import InteractiveConsole
+
+class SimpleDebugger(bdb.Bdb, cmd.Cmd):
+    def __init__(self, completekey='tab', stdin=None, stdout=None):
+        bdb.Bdb.__init__(self)
+        cmd.Cmd.__init__(self, completekey, stdin, stdout)
+        self.prompt = "(simple_pdb) "
+        self.breakpoints: Dict[tuple[str, int], bool] = {}
+        self.stepping = False
+        self.nexting = False
+        self.current_frame = None
+        self.console = InteractiveConsole()
+        self.allow_kbdint = False  # Deshabilita Ctrl+C para evitar interrupts
+    
+    def trace_dispatch(self, frame, event, arg):
+        if self.stop_here(frame, event, arg):
+            self.current_frame = frame
+            self.interaction(frame)
+        return self.trace_dispatch  # Continúa tracing
+    
+    def stop_here(self, frame, event, arg):
+        # Lógica para parar: breakpoints, step, next
+        code = frame.f_code
+        filename = code.co_filename
+        lineno = frame.f_lineno
+        
+        if (filename, lineno) in self.breakpoints:
+            print(f"Breakpoint hit at {filename}:{lineno}")
+            return True
+        
+        if event == 'return':
+            return self.stepping  # Para en returns si stepping
+        
+        if event == 'line':
+            if self.stepping:
+                return True
+            if self.nexting and code.co_name != self._get_parent_func(frame):
+                return False  # Next salta subcalls
+            return self.stepping or self.nexting
+        
+        return False
+    
+    def _get_parent_func(self, frame):
+        # Encuentra función padre para next
+        outer = frame.f_back
+        return outer.f_code.co_name if outer else None
+    
+    def interaction(self, frame):
+        # Loop de comandos
+        self.preloop()
+        while True:
+            try:
+                self.cmdloop()
+                break
+            except KeyboardInterrupt:
+                print("\nInterrumpido por usuario.")
+                break
+        self.postloop()
+    
+    # Comandos CMD
+    def do_step(self, arg):
+        """Step into next line/call."""
+        self.stepping = True
+        self.nexting = False
+        print("Stepping...")
+        self.set_continue()
+    
+    def do_next(self, arg):
+        """Step over next line (no into calls)."""
+        self.nexting = True
+        self.stepping = False
+        print("Next...")
+        self.set_continue()
+    
+    def do_continue(self, arg):
+        """Continue execution until next breakpoint."""
+        self.stepping = False
+        self.nexting = False
+        print("Continuing...")
+        self.set_continue()
+    
+    def do_break(self, arg):
+        """Set breakpoint: break filename:lineno."""
+        parts = arg.split(':')
+        if len(parts) == 2:
+            filename, lineno_str = parts
+            try:
+                lineno = int(lineno_str)
+                self.breakpoints[(filename, lineno)] = True
+                print(f"Breakpoint set at {filename}:{lineno}")
+            except ValueError:
+                print("Uso: break file.py:42")
+        else:
+            print("Uso: break file.py:42")
+    
+    def do_print(self, arg):
+        """Print variable: print varname."""
+        if not self.current_frame:
+            print("No frame available.")
+            return
+        try:
+            # Eval en locals del frame
+            value = eval(arg, self.current_frame.f_globals, self.current_frame.f_locals)
+            print(f"{arg} = {value}")
+        except Exception as e:
+            print(f"Error printing {arg}: {e}")
+    
+    def do_where(self, arg):
+        """Show stack trace."""
+        stack = inspect.stack()
+        for i, (frame, filename, lineno, func, context, idx) in enumerate(stack[:10]):  # Limit to 10
+            print(f"{i}: File \"{filename}\", line {lineno}, in {func}")
+    
+    def do_quit(self, arg):
+        """Quit debugger."""
+        self.set_quit()
+        return True
+    
+    def do_EOF(self, arg):
+        """EOF to quit."""
+        return self.do_quit(arg)
+    
+    def set_continue(self):
+        # Reinicia tracing
+        self.set_step()
+    
+    def set_quit(self):
+        sys.settrace(None)
+        raise bdb.BdbQuit
+    
+    def run(self, code: str, globals=None, locals=None):
+        """Ejecuta código bajo debug."""
+        if globals is None:
+            globals = sys._getframe(1).f_globals
+        if locals is None:
+            locals = globals.copy()
+        
+        sys.settrace(self.trace_dispatch)
+        try:
+            exec(code, globals, locals)
+        except bdb.BdbQuit:
+            pass
+        finally:
+            sys.settrace(None)
+    
+    def run_eval(self, expr: str, globals=None, locals=None):
+        """Eval expr bajo debug."""
+        if globals is None:
+            globals = sys._getframe(1).f_globals
+        if locals is None:
+            locals = globals.copy()
+        sys.settrace(self.trace_dispatch)
+        try:
+            result = eval(expr, globals, locals)
+            print(f"Result: {result}")
+        except bdb.BdbQuit:
+            pass
+        finally:
+            sys.settrace(None)
+        return result
+
+# Ejemplo de uso
+if __name__ == "__main__":
+    debugger = SimpleDebugger()
+    
+    # Código a debuggear
+    debug_code = """
+def factorial(n):
+    if n == 0:
+        return 1
+    else:
+        return n * factorial(n - 1)
+
+result = factorial(5)
+print(f"Factorial 5: {{result}}")
+"""
+    
+    print("Iniciando debugger simple.")
+    debugger.run(debug_code)
+    
+    # Set breakpoint y run
+    debugger.do_break("simple_debugger.py:10")  # Ajusta línea
+    print("\nDebugging con breakpoint...")
+    debugger.run(debug_code)
+    
+    # Interactive eval
+    print("\nEval interactivo...")
+    debugger.run_eval("2 + 2")
+```
+
+Este debugger permite step-by-step: ejecuta, setea break en factorial, steps through recursion. Internamente, `trace_dispatch` maneja eventos, similar a `pdb`. Para ofensivo, úsalo para pausar en funciones remotas inyectando `SimpleDebugger().set_trace()` (método custom).
+
+Extensión: agrega watchpoints para variables.
+
+```python
+# watch_extension.py - Extensión al Debugger
+class WatchDebugger(SimpleDebugger):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.watches: Dict[str, Callable] = {}
+    
+    def do_watch(self, arg):
+        """Watch variable: watch varname condition."""
+        var, _, condition = arg.partition(' ')
+        if not condition:
+            condition = f"{var} != None"
+        self.watches[var] = lambda val: eval(condition, {}, {var: val})
+        print(f"Watch set on {var} with {condition}")
+    
+    def stop_here(self, frame, event, arg):
+        if super().stop_here(frame, event, arg):
+            return True
+        if event == 'line':
+            for var, condition in self.watches.items():
+                if var in frame.f_locals:
+                    val = frame.f_locals[var]
+                    if condition(val):
+                        print(f"Watch hit: {var} = {val}")
+                        return True
+        return False
+```
+
+Ahora, `watch password == 'secret'` pausa cuando cambia.
+
+## Análisis de Inyección de Código en Runtime: Monkey-Patching Seguro
+
+Monkey-patching implica reemplazar métodos o atributos en runtime, común en testing y auditing ético. En Python, debido a su dinamismo, puedes patch `obj.method = new_method`. Para seguridad, usa context managers para revertir patches, evitando side-effects globales.
+
+### Mecánica Interna del Monkey-Patching
+
+Patching modifica el MRO (Method Resolution Order) o dict de instancias/clases. Bajo nivel, un método bound es un PyMethodObject con im_self (self), im_func, im_class. Patching reemplaza im_func, pero globals persisten. Riesgos: race conditions en multihilo, GC issues si referencias circulares.
+
+En hacking ético, monkey-patch para loggear llamadas a funciones de auth o alterar returns para simular bypasses.
+
+### Prácticas Seguras y Módulo Completo
+
+Para seguridad: usa `unittest.mock.patch` o custom context. Analicemos inyección: `sys.modules['module'].func = new_func` inyecta en imports.
+
+```python
+# monkey_patch_seguro.py - Módulo Completo para Monkey-Patching Seguro
+import sys
+import types
+import contextlib
+from typing import Any, Callable, Dict, Optional
+from functools import wraps
+
+class SafeMonkeyPatcher:
+    def __init__(self):
+        self.patches: Dict[str, Any] = {}  # key: (module, attr), value: original
+        self.lock = threading.Lock()  # Para thread-safety (import threading)
+    
+    @contextlib.contextmanager
+    def patch(self, target: Any, attr: str, new_value: Any):
+        """Context manager para patching seguro."""
+        original = getattr(target, attr, None)
+        if original is None:
+            raise AttributeError(f"{attr} no existe en {target}")
+        
+        key = (target, attr)
+        with self.lock:
+            if key in self.patches:
+                raise RuntimeError("Patch ya activo; anida con cuidado")
+            self.patches[key] = original
+            setattr(target, attr, new_value)
+        
+        try:
+            yield new_value
+        finally:
+            with self.lock:
+                setattr(target, attr, original)
+                del self.patches[key]
+    
+    def patch_module_func(self, module_name: str, func_name: str, new_func: Callable):
+        """Patch función en módulo."""
+        module = sys.modules.get(module_name)
+        if not module:
+            raise ImportError(f"Módulo {module_name} no cargado")
+        with self.patch(module, func_name, new_func):
+            yield  # O usa en context
+    
+    def inject_logger(self, func: Callable) -> Callable:
+        """Inyecta logging en función para auditing."""
+        @wraps(func)
+        def logged_func(*args, **kwargs):
+            print(f"Llamada a {func.__name__} con args={args}, kwargs={kwargs}")
+            try:
+                result = func(*args, **kwargs)
+                print(f"Retorno de {func.__name__}: {result}")
+                return result
+            except Exception as e:
+                print(f"Excepción en {func.__name__}: {e}")
+                raise
+        return logged_func
+    
+    def secure_eval_inject(self, code: str, globals: Dict, locals: Dict):
+        """Eval seguro con patching de builtins peligrosos."""
+        # Patch eval para sandbox
+        def safe_eval(expr):
+            if any(danger in expr for danger in ['__import__', 'exec', 'open']):
+                raise ValueError("Operación prohibida")
+            return eval(expr, {"__builtins__": {}}, locals)
+        
+        with self.patch(builtins, 'eval', safe_eval):
+            return eval(code, globals, locals)
+
+# Ejemplo de uso en hacking ético
+import builtins
+import os
+import threading  # Para lock
+
+patcher = SafeMonkeyPatcher()
+
+# Demo 1: Patch os.system para loggear commands (auditing)
+def logged_system(cmd):
+    print(f"Auditing command: {cmd} (NO ejecutado en prod)")
+    return 0  # Simula éxito sin ejecutar
+
+with patcher.patch(os, 'system', logged_system):
+    os.system("ls -la")  # Loggeado, no ejecutado
+
+# Demo 2: Patch función en módulo externo
+def vulnerable_auth(username: str, password: str) -> bool:
+    return username == "admin" and password == "secret"
+
+# Nueva versión patched
+@patcher.inject_logger
+def secure_auth(username: str, password: str) -> bool:
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise TypeError("Inputs must be strings")
+    # Simula hashing
+    return username == "admin" and hash(password) % 100 == 42  # Placeholder
+
+# Patch en runtime
+import types
+vulnerable_auth.__module__ = 'example'  # Simula módulo
+patcher.patch_module_func('example', 'vulnerable_auth', secure_auth)()  # Context simulado
+
+# Uso como generator para persistencia
+def persistent_patch_example():
+    with patcher.patch_module_func('os', 'listdir', lambda path: print(f"Listdir patched: {path}") or []):
+        yield
+        # Código que usa os.listdir aquí
+
+# Ejecución
+if __name__ == "__main__":
+    print("=== Monkey-Patching Seguro ===")
+    
+    # Patch global
+    original_open = open
+    def audited_open(filename, *args, **kwargs):
+        print(f"Auditing open: {filename}")
+        if '/etc/' in filename:
+            raise PermissionError("Acceso denegado en audit")
+        return original_open(filename, *args, **kwargs)
+    
+   

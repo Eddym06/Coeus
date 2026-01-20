@@ -1,0 +1,627 @@
+
+
+# CAPITULO 3: Metaclases y Decoradores Avanzados
+
+# Capítulo 3: Metaclases y Decoradores Avanzados
+
+## Introducción a la Metaprogramación en Python
+
+La metaprogramación en Python representa uno de los pilares más poderosos y flexibles del lenguaje, permitiendo a los desarrolladores manipular el código en tiempo de ejecución o incluso antes de que se ejecute. En esencia, la metaprogramación se trata de escribir código que escribe código, o que modifica el comportamiento de objetos, clases y funciones de manera dinámica. Esto va más allá de la programación orientada a objetos tradicional, donde las clases son entidades estáticas definidas al momento de la escritura. En Python, gracias a su introspección dinámica y su modelo de objetos unificado (todo es un objeto), podemos intervenir en el ciclo de vida de las clases y funciones con herramientas como metaclases, decoradores, descriptores y métodos especiales como `__new__` y `__init__`.
+
+Para entender esto a nivel profundo, recordemos que en Python, las clases no son más que objetos de un tipo especial llamado `type`. Cuando defines una clase como `class MiClase: pass`, Python internamente llama a `type` con tres argumentos: el nombre de la clase, una tupla de clases base y un diccionario de atributos. Es decir, `MiClase = type('MiClase', (), {})`. Esto significa que `type` es la metaclase por defecto, y podemos personalizarla creando nuestras propias metaclases que hereden de `type` y sobrescriban métodos como `__new__` o `__init__` de la metaclase misma.
+
+Profundicemos en los bits y bytes: en el nivel de memoria, una clase en Python es un objeto PyObject que reside en el heap gestionado por el recolector de basura de CPython. Internamente, está representado por una estructura `PyTypeObject` en C, que incluye punteros a diccionarios de métodos, slots para atributos, y referencias a la metaclase. Cuando instancias una clase, `__new__` (de la metaclase) crea la instancia (un PyObject nuevo), y `__init__` la inicializa. Esto es crucial porque `__new__` es un método estático que puede retornar un objeto existente o crear uno nuevo, mientras que `__init__` opera sobre el objeto ya creado. En C, `__new__` corresponde aproximadamente a `PyType_GenericNew`, que alloca memoria vía `PyObject_Malloc` y inicializa los campos básicos, asegurando alineación de memoria (típicamente 8 bytes en sistemas de 64 bits) y nulificando punteros para evitar leaks.
+
+En este capítulo, exploraremos validadores automáticos usando metaclases para inyectar chequeos en atributos de clases, registro de plugins mediante decoradores que modifican el registro global de módulos, y la distinción práctica entre `__new__` y `__init__` con ejemplos que modifican clases en tiempo de creación. Culminaremos con un framework ORM falso completo, inspirado en herramientas como SQLAlchemy, pero implementado puramente con metaprogramación para mapear clases Python a estructuras de base de datos simuladas. Todo esto se construye capa por capa, con código extenso y explicaciones que descienden hasta el nivel de implementación conceptual en C.
+
+## Validadores Automáticos con Metaclases
+
+Los validadores automáticos son un ejemplo perfecto de metaprogramación porque permiten definir reglas de validación en el nivel de la clase, inyectándolas automáticamente en los métodos de instancia sin que el programador tenga que escribir boilerplate repetitivo. Imagina una clase `Usuario` donde el atributo `edad` debe ser un entero positivo menor a 150. En lugar de agregar chequeos manuales en cada setter o en `__init__`, una metaclase puede inspeccionar los atributos en el diccionario de la clase y generar descriptores o métodos wrapper que validen al vuelo.
+
+Empecemos por lo básico: una metaclase simple que detecta atributos anotados con un decorador o tipo especial. Usaremos type hints (de `typing`) para marcar atributos validados. La metaclase heredará de `type` y sobrescribirá `__new__` para modificar el diccionario de la clase antes de crear el tipo final.
+
+Aquí va un módulo completo para validadores automáticos. Este código incluye una metaclase `ValidatorMeta`, descriptores para validación, y ejemplos de uso. Lo expandiré con explicaciones inline y variaciones.
+
+```python
+# modulo_validadores.py
+from typing import Any, Callable, Dict, Type, Union
+from functools import wraps
+import abc
+
+# Primero, definimos un descriptor base para validación. Un descriptor es un objeto
+# que implementa __get__ y __set__ para interceptar accesos a atributos.
+class ValidatorDescriptor:
+    """
+    Descriptor base para validadores. En el nivel de memoria, los descriptores
+    se almacenan en el diccionario de la clase (PyDictObject en C), y cuando se
+    accede a un atributo, Python chequea si es un descriptor vía PyType_HasFeature.
+    Esto permite inyección dinámica sin modificar el objeto instancia.
+    """
+    def __init__(self, validator: Callable[[Any], bool], error_msg: str = "Validación fallida"):
+        self.validator = validator
+        self.error_msg = error_msg
+        # En C, esto sería un PyObject con refcount 1, apuntando a la función validator.
+
+    def __get__(self, instance: Any, owner: Type) -> Any:
+        if instance is None:
+            return self  # Acceso de clase, retorna el descriptor.
+        return instance._data.get(self, None)  # Almacenamos valor en un dict privado de la instancia.
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        if not self.validator(value):
+            raise ValueError(f"{self.error_msg}: {value}")
+        if not hasattr(instance, '_data'):
+            instance._data = {}  # Dict privado para almacenamiento, similar a __dict__ pero controlado.
+        instance._data[self] = value
+        # En memoria, _data es un PyDictObject que alloca ~56 bytes + entries, con hashing via siphash.
+
+    def __delete__(self, instance: Any) -> None:
+        if hasattr(instance, '_data') and self in instance._data:
+            del instance._data[self]
+
+# Decorador para marcar funciones validadoras. Esto permite composabilidad.
+def validator(func: Callable[[Any], bool]) -> Callable:
+    @wraps(func)
+    def wrapper(value: Any) -> bool:
+        # Aquí podríamos agregar logging o tracing, que en CPython involucra PyEval_EvalFrameEx.
+        return func(value)
+    wrapper.is_validator = True  # Marca para que la metaclase lo detecte.
+    return wrapper
+
+# Ejemplo de validador: edad positiva.
+@validator
+def es_edad_valida(edad: int) -> bool:
+    return isinstance(edad, int) and 0 <= edad <= 150
+
+# Otro validador para emails, usando regex (importamos re para completitud).
+import re
+@validator
+def es_email_valido(email: str) -> bool:
+    pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+    return isinstance(email, str) and re.match(pattern, email) is not None
+
+# Ahora, la metaclase principal. Sobrescribe __new__ para inspeccionar y modificar el namespace.
+class ValidatorMeta(type):
+    """
+    Metaclase que automáticamente crea descriptores para atributos anotados.
+    En __new__, creamos el tipo nuevo modificando el dict de attrs.
+    Diferencia clave: __new__ de la metaclase crea el objeto clase (PyTypeObject),
+    mientras que __init__ de la metaclase inicializa ese objeto.
+    """
+    def __new__(mcs, name: str, bases: tuple, namespace: Dict[str, Any], **kwargs) -> Type:
+        # Inspeccionamos el namespace para encontrar anotaciones de tipo que indiquen validadores.
+        # Usamos typing.get_type_hints para introspección.
+        from typing import get_type_hints
+        hints = get_type_hints(namespace, globals(), locals(), include_extras=True)
+        
+        for attr_name, attr_type in hints.items():
+            if hasattr(attr_type, '__origin__') and attr_type.__origin__ is Union:
+                # Si es Union con un validador, extraemos.
+                args = attr_type.__args__
+                if len(args) == 2 and hasattr(args[1], 'is_validator'):
+                    validator = args[1]
+                    # Creamos el descriptor y lo inyectamos en el namespace.
+                    descriptor = ValidatorDescriptor(validator, f"Invalid {attr_name}")
+                    namespace[attr_name] = descriptor
+                    print(f"Inyectando validador para {attr_name} con {validator.__name__}")
+        
+        # Llamamos a type.__new__ para crear el tipo. Esto alloca un PyTypeObject (~1KB+).
+        cls = super().__new__(mcs, name, bases, namespace)
+        return cls
+
+    def __init__(cls, name: str, bases: tuple, namespace: Dict[str, Any]) -> None:
+        # Aquí inicializamos post-creación, e.g., registrando la clase en un global.
+        super().__init__(name, bases, namespace)
+        cls._validated_attrs = [k for k in namespace if isinstance(namespace[k], ValidatorDescriptor)]
+        # En C, esto modifica slots en PyTypeObject.
+
+# Ejemplo de clase usando la metaclase.
+class Usuario(metaclass=ValidatorMeta):
+    edad: 'int | es_edad_valida'  # Sintaxis para Union[int, Validator]
+    email: 'str | es_email_valido'
+    
+    def __init__(self, edad: int, email: str):
+        self.edad = edad  # Esto triggera __set__ del descriptor.
+        self.email = email
+
+# Pruebas exhaustivas.
+if __name__ == "__main__":
+    try:
+        user = Usuario(25, "test@example.com")
+        print(f"Usuario creado: edad={user.edad}, email={user.email}")
+        
+        # Intento inválido.
+        user.edad = -5  # Debería fallar.
+    except ValueError as e:
+        print(f"Error esperado: {e}")
+    
+    # Variación: herencia.
+    class Admin(Usuario, metaclass=ValidatorMeta):
+        permisos: 'list | lambda p: len(p) > 0'  # Lambda como validador inline.
+    
+    # El lambda se convierte en descriptor automáticamente.
+    admin = Admin(30, "admin@site.com")
+    admin.permisos = ['read', 'write']  # OK.
+```
+
+Este código es un módulo completo que demuestra validadores automáticos. La metaclase `ValidatorMeta` en `__new__` inspecciona las anotaciones de tipo (usando `get_type_hints`, que en CPython parsea AST nodes para extraer info de typing). Cuando encuentra un `Union[Tipo, Validador]`, crea un `ValidatorDescriptor` y lo inyecta en el namespace. Los descriptores usan un dict privado `_data` en la instancia para almacenar valores, evitando conflictos con `__dict__` estándar (que es un PyDictObject con hashing).
+
+Profundizando: en el nivel de C, cuando se hace `self.edad = 25`, Python chequea si `edad` en la clase es un descriptor vía `PyDescr_IsData` (chequea si tiene __set__). Si sí, llama `__set__`, que valida y almacena en `_data`. Esto es eficiente porque evita slots fijos; el dict alloca dinámicamente (crece de 8 a 16 entries, etc., con rehashing cada power-of-2).
+
+Para añadir matices, consideremos validación lazy: el descriptor podría diferir la validación hasta el primer acceso, usando weakrefs para evitar ciclos de referencia (en C, `PyWeakref_NewRef` maneja esto). Repitiendo el concepto: `__new__` es para creación (alloca memoria), `__init__` para setup posterior. Si usáramos `__init__` solo en la metaclase, no podríamos modificar el namespace antes de que el tipo exista.
+
+Extendamos con un validador para listas no vacías:
+
+```python
+@validator
+def no_vacia(lista: list) -> bool:
+    return isinstance(lista, list) and len(lista) > 0
+
+class Config(metaclass=ValidatorMeta):
+    opciones: 'list | no_vacia'
+```
+
+Esto inyecta automáticamente, demostrando escalabilidad. En un sistema real, integraríamos con dataclasses para más automatización, pero aquí mantenemos pureza metaprogramática.
+
+## Registro de Plugins con Decoradores Avanzados
+
+Los decoradores avanzados permiten registrar plugins dinámicamente, creando un sistema de discovery donde funciones o clases se auto-registran en un registry global al definirse. Esto es metaprogramación porque el decorador modifica el closure o el módulo en tiempo de importación. Usaremos un patrón singleton para el registry, y decoradores que appendean a listas o dicts.
+
+En detalle: un decorador es una función que toma otra función y retorna una wrapper. Para registro, la wrapper puede side-effectear un dict global. En CPython, los decoradores se evalúan durante la carga del módulo (en `PyModule_Exec`), permitiendo modificación temprana.
+
+Aquí un módulo completo para registro de plugins. Incluye decoradores para funciones y clases, con soporte para prioridades y namespaces.
+
+```python
+# modulo_plugins.py
+from typing import Callable, Dict, List, Any, Optional
+from functools import wraps, update_wrapper
+import sys
+import inspect
+
+# Singleton registry. En C, esto sería un módulo-level PyObject estático.
+class PluginRegistry:
+    _instance = None
+    _plugins: Dict[str, List[Callable]] = {}
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._plugins = {}
+        return cls._instance
+    
+    def register(self, namespace: str, plugin: Callable, priority: int = 0) -> Callable:
+        if namespace not in self._plugins:
+            self._plugins[namespace] = []
+        self._plugins[namespace].append((priority, plugin))
+        # Sort por priority en registro para ordenamiento lazy.
+        self._plugins[namespace].sort(key=lambda x: x[0], reverse=True)  # Mayor priority primero.
+        print(f"Registrado plugin '{plugin.__name__}' en '{namespace}' con priority {priority}")
+        return plugin
+    
+    def get_plugins(self, namespace: str) -> List[Callable]:
+        return [p for prio, p in self._plugins.get(namespace, [])]
+
+registry = PluginRegistry()
+
+# Decorador para funciones. Modifica el wrapper para registrar al decorar.
+def plugin(namespace: str, priority: int = 0):
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Antes de ejecutar, podría hookear pre/post, pero por simplicidad, solo ejecuta.
+            result = func(*args, **kwargs)
+            return result
+        # Registro side-effect: llama a registry.register inmediatamente.
+        registry.register(namespace, wrapper, priority)
+        # En C, esto modifica un PyDict global durante module init.
+        return wrapper
+    return decorator
+
+# Decorador para clases: registra la clase misma, y puede inyectar métodos.
+def class_plugin(namespace: str, priority: int = 0):
+    def decorator(cls: type) -> type:
+        # Registro.
+        registry.register(namespace, cls, priority)
+        # Inyección opcional: agrega un método de hook.
+        def plugin_hook(self):
+            print(f"Hook ejecutado en {cls.__name__}")
+        setattr(cls, 'plugin_hook', plugin_hook)
+        # Update wrapper para preservar metadata.
+        update_wrapper(cls, cls, ('__module__', '__name__', '__qualname__'))
+        return cls
+    return decorator
+
+# Ejemplos de plugins: funciones para procesamiento de datos.
+@plugin("data_processors", priority=10)
+def procesar_email(data: str) -> str:
+    return data.upper() + " PROCESADO"
+
+@plugin("data_processors", priority=5)
+def validar_data(data: str) -> bool:
+    return len(data) > 0
+
+# Clases como plugins, e.g., para UI components.
+@class_plugin("ui_components")
+class Button:
+    def render(self):
+        return "<button>Click me</button>"
+    
+    def plugin_hook(self):
+        print("Button hook called")
+
+# Uso: discovery y ejecución.
+if __name__ == "__main__":
+    # Obtener y ejecutar plugins.
+    processors = registry.get_plugins("data_processors")
+    data = "hello"
+    for proc in processors:
+        print(f"Ejecutando {proc.__name__}: {proc(data)}")
+    
+    # Para clases.
+    components = registry.get_plugins("ui_components")
+    for comp in components:
+        instance = comp()
+        print(instance.render())
+        instance.plugin_hook()
+    
+    # Introspección avanzada: inspeccionar stack para auto-namespace.
+    def auto_register(func: Callable) -> Callable:
+        frame = inspect.currentframe().f_back
+        namespace = frame.f_globals.get('__name__', 'default')
+        return plugin(namespace)(func)
+    
+    @auto_register
+    def mi_plugin_auto():
+        return "Auto registered!"
+    
+    print(mi_plugin_auto())
+```
+
+Este módulo implementa un sistema de plugins robusto. El decorador `plugin` registra la wrapper en el registry singleton durante la decoración (evaluada en tiempo de definición). Para clases, `class_plugin` registra la clase y inyecta métodos via `setattr`, que en CPython actualiza el PyDict de la clase (posiblemente triggerando dict resizing si > load factor 2/3).
+
+Matices nuevos: prioridades permiten ordenamiento, útil para pipelines (e.g., validar antes de procesar). Repitiendo: decoradores son closures que capturan `namespace` y `priority`, almacenados en la closure cell (PyCellObject en C). Para auto-namespace, usamos `inspect` para leer el frame de stack, que accede a `PyFrameObject` internamente, permitiendo metaprogramación reflectiva.
+
+En un framework real, integraríamos con `importlib` para discovery dinámico de módulos, cargando plugins via `importlib.import_module` y ejecutando decoradores en runtime. Esto extiende a hot-reloading, donde modificamos `sys.modules` para recargar.
+
+## Modificación de Clases en Tiempo de Creación: __new__ vs __init__
+
+La distinción entre `__new__` y `__init__` es fundamental en metaprogramación. `__new__(cls, *args, **kwargs)` es un método estático de la clase (o metaclase) que crea y retorna la instancia. Retorna un objeto (o None para singletons), y solo si no es None, se llama `__init__(self, *args, **kwargs)` para inicializarlo. En metaclases, `__new__` crea el objeto clase, `__init__` lo configura.
+
+En C, `__new__` invoca `type_new` que llama `PyType_GenericNew`, allocando via `PyObject_GC_New` (para GC-tracked objects), inicializando ob_refcnt a 1 y ob_type a PyBaseObject_Type. `__init__` es solo un método Python que se llama post-creación.
+
+Ejemplo práctico: modificación en `__new__` para singletons, vs `__init__` para logging.
+
+```python
+# modulo_new_init.py
+from typing import Any, Optional
+import weakref
+
+class SingletonMeta(type):
+    _instances = weakref.WeakValueDictionary()  # Evita memory leaks; en C, weakrefs no previenen GC.
+    
+    def __new__(mcs, name: str, bases: tuple, namespace: Dict[str, Any]) -> type:
+        cls = super().__new__(mcs, name, bases, namespace)
+        # Modificamos post-creación de la clase: agregamos atributo.
+        cls._singleton_instance = None
+        return cls
+    
+    def __init__(cls, name: str, bases: tuple, namespace: Dict[str, Any]) -> None:
+        super().__init__(name, bases, namespace)
+        # Aquí configuramos, e.g., registramos la clase.
+        print(f"Clase {name} inicializada")
+
+class MiSingleton(metaclass=SingletonMeta):
+    def __new__(cls, *args, **kwargs):
+        if cls._singleton_instance is None:
+            # Crea nueva instancia: alloca PyObject.
+            instance = super().__new__(cls)
+            cls._singleton_instance = instance
+            print("Nueva instancia creada en __new__")
+        else:
+            print("Instancia existente retornada")
+        return cls._singleton_instance
+    
+    def __init__(self, value: str):
+        if not hasattr(self, '_initialized'):  # Evita re-init.
+            self.value = value
+            self._initialized = True
+            print(f"Inicializado con {value} en __init__")
+
+# Uso.
+s1 = MiSingleton("primero")
+s2 = MiSingleton("segundo")  # Usa misma instancia, __init__ no se llama.
+print(s1 is s2)  # True
+print(s1.value)  # "primero"
+```
+
+Aquí, `__new__` de la instancia chequea y crea/reusa, mientras la metaclase usa su `__new__` para modificar la clase antes de `__init__`. Matices: si `__new__` retorna un objeto de diferente tipo, `__init__` no se llama, útil para proxies. En memoria, la weakref en SingletonMeta usa `PyWeakref_NewRef`, que no incrementa refcount, permitiendo GC si no hay strong refs.
+
+Para modificación dinámica: una metaclase que monkey-patchea métodos basados en condiciones.
+
+```python
+class DynamicMeta(type):
+    def __new__(mcs, name, bases, namespace):
+        # Si hay un attr 'debug_mode', inyecta logging en métodos.
+        if namespace.get('debug_mode', False):
+            for method_name, method in namespace.items():
+                if callable(method) and not method_name.startswith('_'):
+                    @wraps(method)
+                    def logged_method(self, *args, **kwargs):
+                        print(f"Llamando {method_name} con {args}, {kwargs}")
+                        return method(self, *args, **kwargs)
+                    namespace[method_name] = logged_method
+        return super().__new__(mcs, name, bases, namespace)
+
+class DebugClass(metaclass=DynamicMeta):
+    debug_mode = True
+    def metodo(self, x):
+        return x * 2
+
+dc = DebugClass()
+print(dc.metodo(5))  # Logs antes de retornar 10
+```
+
+Esto modifica el namespace en `__new__`, demostrando intervención temprana.
+
+## Framework ORM Falso Completo Usando Metaclases
+
+Ahora, construyamos un framework ORM falso completo. Este "MiniORM" mapeará clases Python a una base de datos simulada (un dict en memoria), usando metaclases para definir esquemas, descriptores para columnas, y métodos generados para CRUD. Inspirado en SQLAlchemy, pero simplificado.
+
+La metaclase `ModelMeta` inspeccionará atributos para inferir el esquema, generará `__init__` automático, métodos como `save()`, `query()`, y manejará relaciones básicas. Usaremos descriptores para columnas (e.g., IntegerColumn, StringColumn) que validan y serializan.
+
+Módulo completo, extenso:
+
+```python
+# mini_orm.py
+from typing import Any, Dict, List, Type, Optional, Callable
+from abc import ABC, abstractmethod
+import uuid
+import json
+from datetime import datetime
+
+# Base para columnas: descriptores.
+class ColumnDescriptor:
+    def __init__(self, col_type: str, nullable: bool = False, default: Any = None):
+        self.col_type = col_type
+        self.nullable = nullable
+        self.default = default
+        self.name = None  # Set en binding.
+
+    def __set_name__(self, owner: Type, name: str):
+        self.name = name
+
+    def __get__(self, instance: Any, owner: Type) -> Any:
+        if instance is None:
+            return self
+        return instance._data.get(self.name, self.default)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        if value is None and not self.nullable:
+            raise ValueError(f"{self.name} no puede ser None")
+        # Validación por tipo (simple).
+        if self.col_type == 'int' and not isinstance(value, int):
+            raise TypeError(f"{self.name} debe ser int")
+        # Similar para str, etc.
+        if hasattr(instance, '_data'):
+            instance._data[self.name] = value
+        else:
+            instance._data = {self.name: value}
+
+    def to_sql(self, value: Any) -> str:
+        return str(value) if value is not None else 'NULL'
+
+# Tipos de columnas específicas.
+class IntegerColumn(ColumnDescriptor):
+    def __init__(self, nullable: bool = False, default: int = 0):
+        super().__init__('int', nullable, default)
+
+class StringColumn(ColumnDescriptor):
+    def __init__(self, length: int = 255, nullable: bool = False, default: str = ''):
+        self.length = length
+        super().__init__('str', nullable, default)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        if isinstance(value, str) and len(value) > self.length:
+            raise ValueError(f"{self.name} excede longitud {self.length}")
+        super().__set__(instance, value)
+
+class ForeignKeyColumn(ColumnDescriptor):
+    def __init__(self, target_model: Type, nullable: bool = False):
+        self.target_model = target_model
+        super().__init__('fk', nullable)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        if value and not isinstance(value, self.target_model):
+            raise TypeError(f"{self.name} debe ser instancia de {self.target_model}")
+        super().__set__(instance, value)
+
+# DB simulada: dict de tablas, cada tabla es dict id -> row (dict).
+class Database:
+    def __init__(self):
+        self.tables: Dict[str, Dict[str, Dict]] = {}
+        self.sequences: Dict[str, int] = {}  # Para auto-increment.
+
+    def create_table(self, name: str):
+        if name not in self.tables:
+            self.tables[name] = {}
+            self.sequences[name] = 1
+
+    def insert(self, table: str, row: Dict) -> str:
+        self.create_table(table)
+        if 'id' not in row:
+            row['id'] = str(uuid.uuid4())  # O usa sequence.
+        self.tables[table][row['id']] = row
+        return row['id']
+
+    def select(self, table: str, conditions: Optional[Dict] = None) -> List[Dict]:
+        self.create_table(table)
+        rows = list(self.tables[table].values())
+        if conditions:
+            rows = [r for r in rows if all(r.get(k) == v for k, v in conditions.items())]
+        return rows
+
+    def update(self, table: str, row_id: str, updates: Dict) -> bool:
+        if table in self.tables and row_id in self.tables[table]:
+            self.tables[table][row_id].update(updates)
+            return True
+        return False
+
+    def delete(self, table: str, row_id: str) -> bool:
+        if table in self.tables and row_id in self.tables[table]:
+            del self.tables[table][row_id]
+            return True
+        return False
+
+db = Database()  # Instancia global.
+
+# Metaclase para Models.
+class ModelMeta(type):
+    def __new__(mcs, name: str, bases: tuple, namespace: Dict[str, Any]) -> Type:
+        # Recopila columnas de descriptores.
+        columns = {}
+        for attr_name, attr in namespace.items():
+            if isinstance(attr, ColumnDescriptor):
+                attr.__set_name__(name, attr_name)  # Bind name.
+                columns[attr_name] = attr
+                # Infer table name de clase.
+        namespace['_columns'] = columns
+        namespace['_table_name'] = name.lower()  # e.g., Usuario -> usuario
+        
+        # Genera __init__ automático.
+        def auto_init(self, **kwargs):
+            self._data = {}
+            for col_name, col in self._columns.items():
+                value = kwargs.get(col_name, col.default)
+                object.__setattr__(self, col_name, value)  # Usa object para bypass descriptores durante init.
+            self.id = None  # Set post-save.
+        
+        namespace['__init__'] = auto_init
+        
+        # Genera save().
+        def save(self):
+            if self.id is None:
+                self.id = db.insert(self._table_name, self._data)
+            else:
+                db.update(self._table_name, self.id, self._data)
+            print(f"Guardado {name} con id {self.id}")
+        
+        namespace['save'] = save
+        
+        # Genera query classmethod.
+        def query(cls, **conditions) -> List['ModelMeta']:
+            rows = db.select(cls._table_name, conditions)
+            instances = []
+            for row in rows:
+                inst = cls.__new__(cls)
+                inst._data = row
+                inst.id = row.get('id')
+                for col_name in cls._columns:
+                    object.__setattr__(inst, col_name, row.get(col_name, cls._columns[col_name].default))
+                instances.append(inst)
+            return instances
+        
+        namespace['query'] = classmethod(query)
+        
+        # Genera delete().
+        def delete(self):
+            if self.id:
+                db.delete(self._table_name, self.id)
+                self.id = None
+        
+        namespace['delete'] = delete
+        
+        # Para relaciones FK, genera getters/setters, pero por simplicidad, solo bind.
+        
+        cls = super().__new__(mcs, name, bases, namespace)
+        # Registra en DB.
+        db.create_table(cls._table_name)
+        return cls
+
+    def __init__(cls, name, bases, namespace):
+        super().__init__(name, bases, namespace)
+        print(f"Modelo {name} registrado con tabla {cls._table_name}")
+
+# Clase base Model.
+class Model(metaclass=ModelMeta):
+    pass
+
+# Ejemplos de modelos.
+class Usuario(Model):
+    nombre = StringColumn(length=100)
+    edad = IntegerColumn(default=0)
+    email = StringColumn()
+
+class Post(Model):
+    titulo = StringColumn()
+    contenido = StringColumn(length=1000)
+    autor_id = ForeignKeyColumn(Usuario)  # FK a Usuario.
+
+# Uso exhaustivo.
+if __name__ == "__main__":
+    # Crear usuarios.
+    u1 = Usuario(nombre="Alice", edad=30, email="alice@example.com")
+    u1.save()
+    
+    u2 = Usuario(nombre="Bob", edad=25)
+    u2.save()
+    
+    # Query.
+    usuarios = Usuario.query(edad=30)
+    for u in usuarios:
+        print(f"Usuario: {u.nombre}, {u.email}")
+    
+    # Post con FK.
+    p1 = Post(titulo="Mi Post", contenido="Hola", autor_id=u1)
+    p1.save()
+    
+    # Query posts.
+    posts = Post.query()
+    for p in posts:
+        print(f"Post: {p.titulo}, autor: {p.autor_id.nombre if p.autor_id else 'None'}")
+        # Nota: para cargar FK lazy, podríamos agregar __get__ que query si es id.
+    
+    # Update.
+    u1.edad = 31
+    u1.save()
+    
+    # Delete.
+    p1.delete()
+    
+    # Query con condiciones.
+    jovenes = Usuario.query(edad__lt=lambda e: e < 30)  # Extensión: pero aquí simple dict.
+    # Para <, extender db.select con operadores.
+```
+
+Este framework es completo: la metaclase genera todo el boilerplate para CRUD, usando descriptores para columnas que manejan validación y binding. En `__new__`, recopilamos columnas y generamos métodos dinámicamente (asignando funciones al namespace antes de crear el tipo). El DB es un simulado simple con dicts (PyDictObjects), pero ilustra mapeo.
+
+Para profundizar: en un ORM real, serializaríamos a SQL via SQLAlchemy-like engines, pero aquí nos enfocamos en metaprogramación. Relaciones FK usan descriptores que podrían lazy-load (e.g., si value es str id, query el target). En memoria, cada instancia tiene `_data` como dict, y id como attr directo para eficiencia.
+
+Extendamos con relaciones: modifica ForeignKeyColumn para lazy load.
+
+```python
+class ForeignKeyColumn(ColumnDescriptor):
+    # ... init como antes.
+    
+    def __get__(self, instance: Any, owner: Type) -> Any:
+        value = super().__get__(instance, owner)
+        if isinstance(value, str):  # Asume id string.
+            # Lazy load.
+            loaded = self.target_model.query(id=value)
+            if loaded:
+                value = loaded[0]
+            else:
+                value = None
+        return value
+```
+
+Ahora, en el ejemplo, `p.autor_id.nombre` carga automáticamente u1.
+
+Para transacciones, agregaríamos context managers generados por la metaclase, e.g., `@contextmanager def transaction(cls): ...`.
+
+Este ORM falso demuestra el poder: define `class Usuario(Model): nombre = StringColumn()`, y obtienes save/query gratis. Repitiendo: metaclases permiten esto al interceptar creación de clases, modificando namespace en `__new__`.
+
+## Conclusión y Extensiones Avanzadas
+
+Hemos cubierto metaprogramación en profundidad, desde validadores que inyectan descriptores a nivel de bits (descriptores chequeados via C flags), registro de plugins que modifican globals durante module load, distinción `__new__` (creación/mem alloc) vs `__init__` (setup), y un ORM completo que genera APIs via metaclases. Todo con código extenso, descendiendo a implementaciones C conceptuales.
+
+Para más, considera ABCs con metaclases para enforcement, o decoradores con `__call__` para chains. La metaprogramación hace Python Turing-complete en su propio código, permitiendo DSLs embebidos. (Palabras totales: ~3200)

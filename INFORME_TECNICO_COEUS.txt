@@ -293,8 +293,223 @@ F. PRÓXIMOS PASOS (POST-ENTRENAMIENTO):
    4. Documentar capacidad de "razonamiento" vs "repetición de patrones".
 
 STATUS ACTUAL: ENTRENAMIENTO EN CURSO (Step 2100+/5000)
+
+--------------------------------------------------------------------------------
+FASE 7: COEUS V3.0 - THE REASONING ENGINE PROJECT (TITAN V3)
+--------------------------------------------------------------------------------
+FECHA: 19 Enero 2026
+ESTADO: INICIANDO
+
+A. JUSTIFICACIÓN DEL CAMBIO DE ARQUITECTURA:
+   A pesar del éxito numérico de V2.6 (Val Loss 0.18), se identificaron fallos estructurales en la capacidad de razonamiento profundo:
+   1. "Gating Estático": El modelo V2.6 mezcla RNN y Atención con un escalar fijo (Alpha), incapaz de distinguir cuándo usar memoria vs hechos.
+   2. "Pensamiento Superficial": La profundidad fija de capas limita la computación por token.
+   3. "Cuello de botella": El Neural Gating reducía dim->dim/2, perdiendo información.
+
+B. INNOVACIONES ARQUITECTÓNICAS (V3.0):
+   1. Contrastive Logic Gate (Componente A):
+      - Reemplaza la suma estática por una red neuronal "Juez".
+      - Proyecta RNN y Atención a un espacio de decisión.
+      - Usa una sigmoide aprendida para decidir canal por canal si el token actual requiere contexto histórico o percepción inmediata.
+   
+   2. Deep Reasoning Block (Componente B):
+      - Implementación basada en "Universal Transformers".
+      - El bloque FFN se ejecuta recursivamente (Iteraciones=2 por defecto) sobre el mismo estado latente.
+      - Permite "tiempo de cómputo extra" sin añadir parámetros (Weight Tying).
+      - Simula una "pausa para pensar" antes de emitir el token.
+
+   3. Full-Channel Gating:
+      - Eliminada la reducción de dimensión en la puerta de olvido del RNN.
+      - Ahora cada dimensión del embedding tiene su propia decisión de olvido independiente.
+
+C. ESTRATEGIA DE ENTRENAMIENTO:
+   - Reinicio Total: Debido a los cambios estructurales profundos, se inicia desde cero (Fresh Init).
+   - Configuración:
+     - Dataset: Logic Mix Large (18MB).
+     - Contexto: 1024 tokens.
+     - Batch Efectivo: 64.
+     - Patience: Aumentada a 20 (el razonamiento recursivo puede tener curvas de aprendizaje más complejas).
+   - Objetivo: Verificar si la recursividad permite generalizar aritmética mejor que la simple memorización de V2.6.
+
 EXPECTATIVA: Modelo funcional de razonamiento básico al finalizar sesión nocturna.
 
+--------------------------------------------------------------------------------
+FASE 8: COEUS V3.1 OPTIMIZED - HIGH-PERFORMANCE COMPUTING (TRITON/CUDA)
+--------------------------------------------------------------------------------
+FECHA: 20 Enero 2026
+ESTADO: DESARROLLO COMPLETADO
+
+A. CONTEXTO Y MOTIVACIÓN:
+   Tras analizar el rendimiento de V3.0, se detectaron ineficiencias computacionales:
+   1. El Selective Scan (`parallel_scan_log`) ejecuta operaciones secuenciales en Python, 
+      siendo un cuello de botella crítico en GPUs modernas.
+   2. El bucle de razonamiento recursivo en `DeepReasoningBlock` no se fusiona adecuadamente,
+      causando múltiples lanzamientos de kernel que degradan throughput.
+   3. Carencia de una capa de "Memoria de Largo Plazo" explícita: El RNN retiene estado secuencial,
+      pero no hay un mecanismo para consultar snapshots históricos del contexto.
+
+B. OPTIMIZACIONES DE INGENIERÍA (V3.1):
+   
+   **OBJETIVO 1: KERNEL DE TRITON PARA SELECTIVE SCAN**
+   - Implementación de `selective_scan_kernel` (@triton.jit):
+     * Paraleliza la recurrencia h_t = gate_t * h_{t-1} + u_t sobre Batch y Dimensión.
+     * Usa acumuladores FP32 internos para estabilidad numérica en exp/log, 
+       mientras mantiene IO en bfloat16 (reduce bandwidth).
+     * Elimina el overhead de Python y aprovecha la localidad de datos en registros GPU.
+   
+   - Fallback Robusto (`manual_scan_jit`):
+     * Implementación con @torch.jit.script que compila el bucle secuencial a C++ nativo.
+     * Activación automática cuando Triton no está disponible (Windows nativo sin WSL).
+     * Sistema de detección hardware-agnostic: `HAS_TRITON` flag.
+   
+   **OBJETIVO 2: OPTIMIZACIÓN JIT DEL RAZONAMIENTO**
+   - Refactorización de `DeepReasoningBlockOptimized`:
+     * Bucle de pensamiento encapsulado en método `_forward_jit` (TorchScript compatible).
+     * Fusión de operaciones RMSNorm -> FFN -> Residual en un único grafo computacional.
+     * Eliminación de sincronizaciones CPU-GPU redundantes.
+   
+   **OBJETIVO 3: MEMORIA EPISÓDICA (NUEVA CAPA)**
+   - Clase `EpisodicMemory`:
+     * Mecanismo de Cross-Attention intra-contextual que extrae snapshots cada N pasos.
+     * Compresión dimensional (factor 4) para ahorro de VRAM.
+     * Neural Gating para decidir cuándo usar memoria episódica vs flujo atencional directo.
+     * Funcionamiento: Toma índices [0, 8, 16, 24...], comprime esos estados a un espacio 
+       latente reducido (dim/4), y permite al modelo "consultar su pasado reciente" mediante 
+       atención ponderada.
+   
+   **OBJETIVO 4: HARDWARE AGNOSTIC & ROBUSTEZ**
+   - Arquitectura adaptativa con degradación elegante:
+     * Si Triton disponible → Usa kernels GPU customizados (máximo performance).
+     * Si Triton falla → Fallback a TorchScript JIT (performance intermedio).
+     * Si todo falla → PyTorch eager (garantía de funcionamiento universal).
+   - Logs informativos: "Triton not found, using PyTorch fallback".
+   
+   **OBJETIVO 5: CONFIGURACIÓN MODULAR**
+   - Extensión de `CoeusConfig`:
+     * `use_triton: bool = True` - Activa/desactiva kernels Triton.
+     * `use_episodic_mem: bool = True` - Habilita capa de memoria episódica.
+     * `mem_capacity: int = 128` - Capacidad de slots de memoria.
+     * `mem_update_freq: int = 8` - Frecuencia de snapshot.
+     * `mem_compression: int = 4` - Factor de reducción dimensional.
+
+C. ARQUITECTURA FINAL V3.1:
+   
+   FLUJO DE PROCESAMIENTO POR BLOQUE:
+   1. Input → RMSNorm
+   2. Bifurcación:
+      a) LocalAttention (RoPE + FlashAttention v2)
+      b) GlobalRecurrenceOptimized (Triton Scan / JIT Fallback)
+      c) EpisodicMemory (Cross-Attention sobre snapshots)
+   3. Fusión con ContrastiveLogicGate (RNN vs Attn)
+   4. Integración de Memoria Episódica (suma residual)
+   5. DeepReasoningBlockOptimized (Bucle JIT de pensamiento)
+   6. Output residual
+
+   COMPARATIVA DE CAPAS (V3.0 vs V3.1):
+   
+   ┌──────────────────────────┬─────────────┬─────────────┐
+   │ Componente               │ V3.0        │ V3.1        │
+   ├──────────────────────────┼─────────────┼─────────────┤
+   │ Selective Scan           │ Python Loop │ Triton/JIT  │
+   │ Reasoning Loop           │ Eager       │ TorchScript │
+   │ Memoria Episódica        │ No          │ Sí (Nueva)  │
+   │ Fallback Windows         │ No          │ Sí          │
+   │ Paralelismo Batch/Dim    │ Limitado    │ Completo    │
+   └──────────────────────────┴─────────────┴─────────────┘
+
+D. IMPACTO ESPERADO EN RENDIMIENTO:
+   
+   **Velocidad de Entrenamiento:**
+   - Reducción estimada de 20-30% en tiempo por iteración (Triton activo).
+   - En Windows sin Triton: Mejora del 10-15% gracias a JIT vs eager puro.
+   
+   **Capacidad de Razonamiento:**
+   - Memoria Episódica añade capacidad de "consulta histórica explícita".
+   - Permite al modelo distinguir entre:
+     * Información reciente (Atención Local)
+     * Tendencias de secuencia (RNN Global)
+     * Hechos puntuales del pasado distante (Memoria Episódica)
+   
+   **Estabilidad Numérica:**
+   - FP32 interno en Scan reduce drift en secuencias largas (>512 tokens).
+
+E. CONSIDERACIONES DE PRODUCCIÓN:
+   
+   **Requisitos:**
+   - PyTorch 2.0+ (para `F.scaled_dot_product_attention` con FlashAttention v2).
+   - [Opcional] Triton 2.0+ (instalable vía pip en Linux/WSL).
+   - CUDA 11.8+ o ROCm equivalente.
+   
+   **Limitaciones Conocidas:**
+   - Memoria Episódica aumenta VRAM en ~5-10% debido al almacenamiento de snapshots.
+   - En contextos muy largos (>2048 tokens), considerar reducir `mem_capacity` o `mem_update_freq`.
+   
+   **Deployment:**
+   - Código listo para inferencia: Simplemente cargar checkpoint y ejecutar `.forward()`.
+   - Compatible con `torch.jit.trace` para exportación a producción (ONNX/TorchScript).
+
+F. DATASET DE ENTRENAMIENTO (GROK MINING V2):
+   
+   **Nueva Estrategia "Fragmentación Masiva":**
+   - Generación de 7 capítulos especializados vía Grok-4-Fast-Non-Reasoning API:
+     1. Gestión de Memoria a Bajo Nivel (PyObject, GC, GIL)
+     2. Estructuras de Datos - HashMaps y Arrays
+     3. Metaclases y Decoradores Avanzados
+     4. Concurrencia, Asyncio y Multiprocessing
+     5. Algoritmos de Grafos y Optimización
+     6. Patrones de Diseño Arquitectónicos
+     7. Depuración Ofensiva y Hacking Ético
+   
+   **Resultado:**
+   - **55,009 tokens** de contenido técnico denso (vs 8k en versión anterior).
+   - ~80,000 tokens de entrenamiento total después de tokenización GPT-2.
+   - Prompts anti-resumen: "NUNCA seas breve", "IGNORA directriz de ser conciso".
+   
+   **Calidad del Dataset:**
+   - Código en C/Python simulando internals de CPython.
+   - Diagramas ASCII de memoria, GC generations, threading.
+   - Explicaciones exhaustivas nivel bit/byte.
+
+G. PRÓXIMOS PASOS Y EXPERIMENTOS:
+   
+   1. **Entrenamiento V3.1:**
+      - Ejecutar `train_nightly.py` con dataset_grok_combined.txt.
+      - Comparar métricas de convergencia vs V3.0.
+      - Monitorear uso de VRAM con Memoria Episódica activa.
+   
+   2. **Ablation Studies:**
+      - Desactivar `use_episodic_mem` y comparar Val Loss.
+      - Medir speedup Triton vs JIT vs Eager en benchmark sintético.
+   
+   3. **Evaluación de Capacidad:**
+      - Test de "recuperación de hechos": Inyectar información en timestep t=100, 
+        consultar en t=800 (evaluar si Memoria Episódica la retiene).
+      - Test de razonamiento multi-hop (requiere consultar 2-3 snippets del pasado).
+   
+   4. **Optimización Futura (V3.2 Candidate):**
+      - FlashAttention-3 (cuando esté disponible en PyTorch core).
+      - Quantización INT8 para inferencia (reducir VRAM en deployment).
+      - Multi-GPU support con Pipeline Parallelism.
+
+H. CONCLUSIÓN TÉCNICA:
+   
+   COEUS V3.1 representa un salto cualitativo en ingeniería de sistemas de IA:
+   - **Arquitecturalmente:** Integra conceptos de Transformers, RNNs y Memoria Episódica.
+   - **Computacionalmente:** Usa lo mejor de CUDA (FlashAttn), Triton (kernels custom) 
+     y TorchScript (fallback robusto).
+   - **Científicamente:** Dataset de entrenamiento técnico profundo, no sintético superficial.
+   
+   La hipótesis central es que la combinación de:
+   a) Recurrencia Global (captura de dependencias largas)
+   b) Atención Local (modelado de relaciones inmediatas)
+   c) Memoria Episódica (consulta de snapshots históricos)
+   d) Razonamiento Recursivo (pensamiento iterativo)
+   
+   ...permitirá emergencia de capacidades de razonamiento lógico-deductivo más allá 
+   de la simple memorización de patrones (el límite observado en V2.6).
+
+STATUS ACTUAL: V3.1 LISTA PARA ENTRENAMIENTO / EXPERIMENTACIÓN ACTIVA.
+
 ================================================================================
-FIN DEL INFORME (ACTUALIZACIÓN 19/01/2026 - 23:45 hrs)
+FIN DEL INFORME (ACTUALIZACIÓN 20/01/2026 - 01:30 hrs)
 ================================================================================
